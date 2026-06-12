@@ -16,7 +16,7 @@ var peer: WebTransportPeer
 var my_id := 0
 var phase := "hub"
 var bot := OS.get_environment("BOT") == "1"
-var xr := OS.get_environment("XR") == "1"
+var xr := OS.get_environment("XR") == "1" or OS.has_feature("mobile")
 var xr_interface: XRInterface
 var xr_origin: XROrigin3D
 var right_hand: XRController3D
@@ -159,7 +159,15 @@ func _physics_process(delta: float) -> void:
 		handle(peer.get_packet().get_string_from_utf8())
 	if peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
 		if Time.get_ticks_msec() - t0 > 30000 and not loop_done:
-			printerr("BOT %s TIMEOUT pre-connect" % bot_name); get_tree().quit(1)
+			if bot and OS.get_environment("BOT_NO_TIMEOUT") != "1":
+				printerr("BOT %s TIMEOUT pre-connect" % bot_name); get_tree().quit(1)
+			else:
+				# a human client retries instead of dying
+				t0 = Time.get_ticks_msec()
+				peer.close()
+				peer = WebTransportPeer.new()
+				peer.create_client(server_host(), PORT, "/wt")
+				my_id = 0
 		return
 	if my_id == 0:
 		peer.put_packet(("join:%s" % bot_name).to_utf8_buffer())
@@ -172,7 +180,7 @@ func _physics_process(delta: float) -> void:
 	if send_accum >= 0.1:
 		send_accum = 0.0
 		peer.put_packet(("pos:%.2f:%.2f" % [avatar.position.x, avatar.position.z]).to_utf8_buffer())
-	if Time.get_ticks_msec() - t0 > 120000 and bot and not loop_done:
+	if Time.get_ticks_msec() - t0 > 120000 and bot and not loop_done and OS.get_environment("BOT_NO_TIMEOUT") != "1":
 		printerr("BOT %s TIMEOUT phase=%s" % [bot_name, phase]); get_tree().quit(1)
 
 func _on_xr_button(button: String, right: bool) -> void:

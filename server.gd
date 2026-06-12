@@ -58,6 +58,7 @@ func handle(pid: int, parts: PackedStringArray) -> void:
 			# the starting kit (the shop's free-kit pressure valve)
 			players[pid]["kit"] = true
 			send_to(pid, "kit:monomate")
+			print("JOIN peer=%d name=%s roster=%d" % [pid, parts[1], players.size()])
 			broadcast("roster:%d" % players.size())
 		"pos":
 			if players.has(pid):
@@ -67,6 +68,7 @@ func handle(pid: int, parts: PackedStringArray) -> void:
 				players[pid]["ready"] = true
 				var n := 0
 				for p in players: if players[p]["ready"]: n += 1
+				print("VOTE peer=%d votes=%d/%d" % [pid, n, PLAYERS_NEEDED])
 				broadcast("votes:%d/%d" % [n, PLAYERS_NEEDED])
 				if n >= PLAYERS_NEEDED:
 					phase = "fade_out"
