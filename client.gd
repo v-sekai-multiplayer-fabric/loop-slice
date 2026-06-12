@@ -3,10 +3,24 @@ extends Node3D
 # -> loot grab -> return. Flatscreen (WASD + mouse, SPACE attack, E grab,
 # T teleport vote). BOT=1 drives the same loop unattended for the smoke.
 const PORT = 54400
+
+static func server_host() -> String:
+	var env := OS.get_environment("LOOP_HOST")
+	if env != "": return env
+	if FileAccess.file_exists("res://server_host.txt"):
+		var h := FileAccess.open("res://server_host.txt", FileAccess.READ).get_as_text().strip_edges()
+		if h != "": return h
+	return "127.0.0.1"
+
 var peer: WebTransportPeer
 var my_id := 0
 var phase := "hub"
 var bot := OS.get_environment("BOT") == "1"
+var xr := OS.get_environment("XR") == "1"
+var xr_interface: XRInterface
+var xr_origin: XROrigin3D
+var right_hand: XRController3D
+var left_hand: XRController3D
 var bot_name: String = OS.get_environment("BOT_NAME") if OS.get_environment("BOT_NAME") != "" else "player"
 var avatar: CharacterBody3D
 var remotes := {}      # pid -> MeshInstance3D
@@ -20,9 +34,16 @@ var bot_attack_timer := 0.0
 var send_accum := 0.0
 
 func _ready() -> void:
+	if xr:
+		xr_interface = XRServer.find_interface("OpenXR")
+		if xr_interface and (xr_interface.is_initialized() or xr_interface.initialize()):
+			get_viewport().use_xr = true
+			print("XR session up: ", xr_interface.get_name())
+		else:
+			printerr("XR requested but OpenXR failed to initialize"); get_tree().quit(3); return
 	_build_world()
 	peer = WebTransportPeer.new()
-	if peer.create_client("127.0.0.1", PORT, "/wt") != OK:
+	if peer.create_client(server_host(), PORT, "/wt") != OK:
 		printerr("connect failed"); get_tree().quit(1); return
 	t0 = Time.get_ticks_msec()
 
@@ -48,8 +69,22 @@ func _build_world() -> void:
 	am.mesh = cap; am.position.y = 0.8
 	var amat := StandardMaterial3D.new(); amat.albedo_color = Color(0.9, 0.8, 0.2); am.material_override = amat
 	avatar.add_child(am)
-	var cam := Camera3D.new(); cam.position = Vector3(0, 3.2, 4.5); cam.rotation_degrees.x = -30
-	avatar.add_child(cam)
+	if xr:
+		xr_origin = XROrigin3D.new()
+		var xr_cam := XRCamera3D.new(); xr_cam.position.y = 1.7
+		xr_origin.add_child(xr_cam)
+		left_hand = XRController3D.new(); left_hand.tracker = "left_hand"
+		right_hand = XRController3D.new(); right_hand.tracker = "right_hand"
+		xr_origin.add_child(left_hand); xr_origin.add_child(right_hand)
+		for h in [left_hand, right_hand]:
+			var hm := MeshInstance3D.new(); var hs := SphereMesh.new(); hs.radius = 0.06; hs.height = 0.12
+			hm.mesh = hs; h.add_child(hm)
+		avatar.add_child(xr_origin)
+		right_hand.button_pressed.connect(_on_xr_button.bind(true))
+		left_hand.button_pressed.connect(_on_xr_button.bind(false))
+	else:
+		var cam := Camera3D.new(); cam.position = Vector3(0, 3.2, 4.5); cam.rotation_degrees.x = -30
+		avatar.add_child(cam)
 	avatar.position = Vector3(0, 0, 4); add_child(avatar)
 	# enemy + loot placeholders
 	enemy_node = _ball(Vector3(0, 0.9, -4), 0.9, Color(0.85, 0.2, 0.2)); enemy_node.visible = false
@@ -140,7 +175,24 @@ func _physics_process(delta: float) -> void:
 	if Time.get_ticks_msec() - t0 > 120000 and bot and not loop_done:
 		printerr("BOT %s TIMEOUT phase=%s" % [bot_name, phase]); get_tree().quit(1)
 
-func _human_drive(_delta: float) -> void:
+func _on_xr_button(button: String, right: bool) -> void:
+	if right and button == "trigger_click":
+		peer.put_packet("attack:x".to_utf8_buffer())
+	elif right and button == "ax_button":
+		peer.put_packet("grab:x".to_utf8_buffer())
+	elif not right and button == "by_button":
+		peer.put_packet("teleport:x".to_utf8_buffer())
+
+func _human_drive(delta: float) -> void:
+	if xr and left_hand:
+		var stick: Vector2 = left_hand.get_vector2("primary")
+		var fwd: Vector3 = Vector3.FORWARD
+		if xr_origin.has_node("XRCamera3D"):
+			fwd = -(xr_origin.get_node("XRCamera3D") as XRCamera3D).global_transform.basis.z
+		fwd.y = 0.0; fwd = fwd.normalized()
+		var rightv: Vector3 = fwd.cross(Vector3.UP) * -1.0
+		avatar.position += (fwd * -stick.y + rightv * stick.x) * 3.0 * delta
+		return
 	var dir := Vector3.ZERO
 	if Input.is_key_pressed(KEY_W): dir.z -= 1
 	if Input.is_key_pressed(KEY_S): dir.z += 1

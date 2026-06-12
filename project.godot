@@ -2,5 +2,12 @@ config_version=5
 [application]
 config/name="loop_slice"
 run/main_scene="res://main.tscn"
+config/icon="res://icon.svg"
 [rendering]
 renderer/rendering_method="forward_plus"
+renderer/rendering_method.mobile="mobile"
+textures/vram_compression/import_etc2_astc=true
+
+[xr]
+openxr/enabled=true
+shaders/enabled=true
