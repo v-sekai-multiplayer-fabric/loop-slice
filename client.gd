@@ -12,7 +12,7 @@ static func server_host() -> String:
 		if h != "": return h
 	return "127.0.0.1"
 
-var peer: WebTransportPeer
+var peer: MultiplayerPeer
 var my_id := 0
 var phase := "hub"
 var bot := OS.get_environment("BOT") == "1"
@@ -20,6 +20,8 @@ var spectate := OS.get_environment("SPECTATE") == "1"
 var _focus_order: Array = []
 var _focus_idx: int = -1
 var _spec_cam: Camera3D = null
+var last_server_ms: int = 0
+var welcome_ms: int = 0
 var xr := OS.get_environment("XR") == "1" or OS.has_feature("mobile")
 var xr_interface: XRInterface
 var xr_origin: XROrigin3D
@@ -29,6 +31,22 @@ var bot_name: String = ("spectator" if OS.get_environment("SPECTATE") == "1" els
 var avatar: CharacterBody3D
 var remotes := {}      # pid -> MeshInstance3D
 var enemy_node: MeshInstance3D
+var enemy_hp := 100
+# packets queued from outside _physics_process (e.g. the runtime MCP). Draining
+# them inside the frame loop (next to tf/pong) sends through the SAME flushed path,
+# so injected sends behave exactly like the client's own input.
+var mcp_queue: Array = []
+func mcp_send(s: String) -> void: mcp_queue.append(s)
+# Control goes reliable; high-frequency "tf" (position) goes unreliable. On
+# WebTransport each reliable packet opens a fresh bidi stream, so streaming tf
+# reliably exhausts the QUIC stream limit in seconds and wedges all sends.
+const CH_CONTROL := 0   # reliable, ordered: join/vote/attack/grab/pong/bye
+const CH_POSITION := 1  # unreliable: high-frequency tf
+func _put(s: String, reliable := true, channel := CH_CONTROL) -> void:
+	if not peer: return
+	peer.set_transfer_channel(channel)
+	peer.set_transfer_mode(MultiplayerPeer.TRANSFER_MODE_RELIABLE if reliable else MultiplayerPeer.TRANSFER_MODE_UNRELIABLE)
+	peer.put_packet(s.to_utf8_buffer())
 var loot_node: MeshInstance3D
 var fade: ColorRect
 var hud: Label
@@ -46,10 +64,19 @@ func _ready() -> void:
 		else:
 			printerr("XR requested but OpenXR failed to initialize"); get_tree().quit(3); return
 	_build_world()
-	peer = WebTransportPeer.new()
-	if peer.create_client(server_host(), PORT, "/wt") != OK:
+	peer = _make_client_peer()
+	if not peer:
 		printerr("connect failed"); get_tree().quit(1); return
 	t0 = Time.get_ticks_msec()
+
+# Transport is switchable: ENet locally (stable), WebTransport with TRANSPORT=wt
+# for the Quest-web path. Same text protocol either way.
+func _make_client_peer() -> MultiplayerPeer:
+	if OS.get_environment("TRANSPORT") == "wt":
+		var w := WebTransportPeer.new()
+		return w if w.create_client(server_host(), PORT, "/wt") == OK else null
+	var e := ENetMultiplayerPeer.new()
+	return e if e.create_client(server_host(), PORT) == OK else null
 
 func _build_world() -> void:
 	var sun := DirectionalLight3D.new(); sun.rotation_degrees = Vector3(-50, -30, 0); add_child(sun)
@@ -86,7 +113,7 @@ func _build_world() -> void:
 		if am0: am0.visible = false       # do not draw the spectator body
 	elif xr:
 		xr_origin = XROrigin3D.new()
-		var xr_cam := XRCamera3D.new(); xr_cam.position.y = 1.7
+		var xr_cam := XRCamera3D.new()   # head height comes from headset tracking, origin at floor
 		xr_origin.add_child(xr_cam)
 		left_hand = XRController3D.new(); left_hand.tracker = "left_hand"
 		right_hand = XRController3D.new(); right_hand.tracker = "right_hand"
@@ -98,7 +125,10 @@ func _build_world() -> void:
 		right_hand.button_pressed.connect(_on_xr_button.bind(true))
 		left_hand.button_pressed.connect(_on_xr_button.bind(false))
 	else:
-		var cam := Camera3D.new(); cam.position = Vector3(0, 3.2, 4.5); cam.rotation_degrees.x = -30
+		var cam := Camera3D.new()
+		cam.position = Vector3(0, 7.0, 6.0)        # high 3/4 tactical, frames you + the arena
+		cam.rotation_degrees.x = -48
+		cam.fov = 52
 		avatar.add_child(cam)
 	avatar.position = Vector3(0, 0, 4); add_child(avatar)
 	# enemy + loot placeholders
@@ -138,9 +168,9 @@ func _remote(pid: int, kind: String) -> Node3D:
 		holder.add_child(orb)
 		orb.call("setup", col)
 		orb.position.y = 0.9
-		orb.scale = Vector3(2.2, 2.2, 2.2) if is_xr else Vector3(1.6, 1.6, 1.6)
 		# label
 		var lbl := Label3D.new()
+		lbl.name = "Label3D"
 		lbl.text = ("Q3 #%d" % pid) if is_xr else ("P%d" % pid)
 		lbl.position = Vector3(0, 2.1, 0); lbl.font_size = 72; lbl.modulate = col
 		lbl.billboard = BaseMaterial3D.BILLBOARD_ENABLED
@@ -155,9 +185,49 @@ func _remote(pid: int, kind: String) -> Node3D:
 		ring.visible = false
 		holder.add_child(ring)
 		holder.set_meta("orb", orb); holder.set_meta("col", col)
+		holder.set_meta("base_scale", 1.4 if is_xr else 1.0)
+		holder.set_meta("tag", ("Q3 #%d" % pid) if is_xr else ("P%d" % pid))
+		holder.set_meta("rtt", 0); holder.set_meta("age", 0)
+		var s0: float = 1.4 if is_xr else 1.0
+		holder.scale = Vector3(s0, s0, s0)
 		remotes[pid] = holder
 		_focus_order.append(pid)
 	return remotes[pid]
+
+func _combat_fx(p: PackedStringArray) -> void:
+	# server sends fx:swing<stage>[:hit<dmg>|:outofrange|:blocked|:death], or fx:whiff / fx:comboDrop
+	if bot or spectate: return
+	var hit := false
+	for i in range(1, p.size()):
+		var tok := p[i]
+		if tok.begins_with("hit"):
+			hud.text = "HIT %s!  beast HP %d/100" % [tok.substr(3), enemy_hp]
+			hit = true
+		elif tok == "outofrange":
+			hud.text = "OUT OF RANGE — walk closer to the beast (WASD)"
+		elif tok == "blocked":
+			hud.text = "BLOCKED — the beast is warming up, hit again"
+		elif tok == "death":
+			hud.text = "BEAST DOWN! press E to grab the loot"
+		elif tok == "whiff":
+			hud.text = "WHIFF — time your taps to the beat"
+		elif tok == "comboDrop":
+			hud.text = "combo dropped — restart the chain"
+	if hit and enemy_node and enemy_node.visible:
+		_flash_enemy()
+
+func _flash_enemy() -> void:
+	var mi := enemy_node
+	var mat := mi.get_active_material(0)
+	if mat is StandardMaterial3D:
+		var base: Color = (mat as StandardMaterial3D).albedo_color
+		var t := create_tween()
+		(mat as StandardMaterial3D).albedo_color = Color(1, 1, 1)
+		t.tween_property(mat, "albedo_color", base, 0.18)
+	var s := mi.scale
+	var t2 := create_tween()
+	mi.scale = s * 1.18
+	t2.tween_property(mi, "scale", s, 0.15)
 
 func handle(msg: String) -> void:
 	var p = msg.split(":")
@@ -182,14 +252,20 @@ func handle(msg: String) -> void:
 				elif bot:
 					var verdict := "GRANT" if got_grant else ("REJECT" if got_reject else "NONE")
 					print("BOT %s LOOP COMPLETE outcome=%s" % [bot_name, verdict])
-					peer.put_packet("bye:x".to_utf8_buffer())
+					_put("bye:x")
 					get_tree().quit(0)
 				else:
 					loop_done = true
 					hud.text = "back in hub — loop complete"
 		"enemy":
-			if p[1] == "spawned": enemy_node.visible = true
-			elif p[1] == "hp" and int(p[2]) == 0: enemy_node.visible = false
+			if p[1] == "spawned":
+				enemy_node.visible = true; enemy_hp = 100
+				if not bot and not spectate: hud.text = "FIELD — beast HP 100/100 — walk up (WASD), SPACE on the beat"
+			elif p[1] == "hp":
+				enemy_hp = int(p[2])
+				if not bot and not spectate and enemy_hp > 0:
+					hud.text = "FIELD — beast HP %d/100 — keep the combo, E to grab loot" % enemy_hp
+				if enemy_hp == 0: enemy_node.visible = false
 		"loot":
 			loot_node.visible = true
 		"grant":
@@ -197,7 +273,15 @@ func handle(msg: String) -> void:
 			hud.text = "GRANTED item %s!" % p[1]
 		"reject":
 			got_reject = true; loot_node.visible = false
-		"fx": pass # combat feedback; the HUD shows phase text
+		"ping":
+			_put("pong:%s" % p[1])
+		"left":
+			var lpid := int(p[1])
+			if remotes.has(lpid):
+				remotes[lpid].queue_free()
+				remotes.erase(lpid)
+				_focus_order.erase(lpid)
+		"fx": _combat_fx(p)
 		"p":
 			if p.size() < 7: return        # tolerate older/short transform packets
 			var pid := int(p[1])
@@ -207,30 +291,68 @@ func handle(msg: String) -> void:
 				h.position = Vector3(float(p[2]), 0.0, float(p[4]))
 				var yaw := float(p[5])
 				h.get_meta("orb").call("update_from_basis", Basis(Vector3.UP, yaw))
+				h.set_meta("rtt", (int(p[7]) if p.size() > 7 else 0))
+				h.set_meta("age", (int(p[8]) if p.size() > 8 else 0))
+
+func _breathe() -> void:
+	var t := Time.get_ticks_msec() / 1000.0
+	for pid in remotes:
+		var h = remotes[pid]
+		var rtt: int = h.get_meta("rtt", 0)
+		var age: int = h.get_meta("age", 0)
+		var base: float = h.get_meta("base_scale", 2.0)
+		var live := age < 400                      # heard within 0.4 s
+		var rate := 5.0 if live else 1.0           # breathe fast when connected
+		var amp := 0.16 if live else 0.05
+		var s := base * (1.0 + amp * sin(t * rate))
+		h.scale = Vector3(s, s, s)
+		# colour: green<60ms, yellow<150, orange<300, red else; grey if stale
+		var col: Color
+		if age > 1500: col = Color(0.4, 0.4, 0.45)         # disconnected
+		elif rtt < 60: col = Color(0.3, 1.0, 0.45)
+		elif rtt < 150: col = Color(0.95, 0.9, 0.3)
+		elif rtt < 300: col = Color(1.0, 0.6, 0.2)
+		else: col = Color(1.0, 0.3, 0.3)
+		h.get_meta("orb").call("setup", col)
+		var lbl = h.get_node_or_null("Label3D")
+		if lbl: lbl.text = "%s  %dms" % [h.get_meta("tag", "P%d" % pid), rtt]
 
 func _physics_process(delta: float) -> void:
 	if not peer: return
 	peer.poll()
 	while peer.get_available_packet_count() > 0:
+		last_server_ms = Time.get_ticks_msec()
 		handle(peer.get_packet().get_string_from_utf8())
-	if peer.get_connection_status() != MultiplayerPeer.CONNECTION_CONNECTED:
-		if Time.get_ticks_msec() - t0 > 30000 and not loop_done:
-			if bot and OS.get_environment("BOT_NO_TIMEOUT") != "1":
-				printerr("BOT %s TIMEOUT pre-connect" % bot_name); get_tree().quit(1)
-			else:
-				# a human client retries instead of dying
-				t0 = Time.get_ticks_msec()
-				peer.close()
-				peer = WebTransportPeer.new()
-				peer.create_client(server_host(), PORT, "/wt")
-				my_id = 0
+	var now := Time.get_ticks_msec()
+	var status := peer.get_connection_status()
+	# transport down (or stuck connecting > 4 s): rebuild the client and rejoin
+	if status == MultiplayerPeer.CONNECTION_DISCONNECTED or (status != MultiplayerPeer.CONNECTION_CONNECTED and now - t0 > 4000):
+		if bot and OS.get_environment("BOT_NO_TIMEOUT") != "1" and now - t0 > 30000:
+			printerr("BOT %s TIMEOUT" % bot_name); get_tree().quit(1)
+		t0 = now; last_server_ms = now
+		peer.close(); peer = _make_client_peer()
+		my_id = 0
 		return
+	if status != MultiplayerPeer.CONNECTION_CONNECTED:
+		return
+	# connected — join, then watch for a silent server (dropped by liveliness)
 	if my_id == 0:
-		peer.put_packet(("join:%s:%s" % [bot_name, ("xr" if xr else "flat")]).to_utf8_buffer())
-		my_id = -1 # waiting for welcome
+		_put("join:%s:%s" % [bot_name, ("xr" if xr else "flat")])
+		my_id = -1; welcome_ms = now; last_server_ms = now
 		return
-	if my_id < 0: return
-	if spectate: _spectate_focus(delta)
+	if my_id < 0:
+		if now - welcome_ms > 3000: my_id = 0   # no welcome — resend join
+		return
+	# (the "server went silent" rejoin path is removed: it false-triggered on
+	#  normal play and caused connect churn. A real drop shows as transport-down
+	#  above, which reconnects.)
+	# drain externally-queued packets through the working send path
+	if not mcp_queue.is_empty():
+		for s in mcp_queue: _put(String(s))
+		mcp_queue.clear()
+	if spectate:
+		_breathe()
+		_spectate_focus(delta)
 	elif bot: _bot_drive(delta)
 	else: _human_drive(delta)
 	send_accum += delta
@@ -242,17 +364,17 @@ func _physics_process(delta: float) -> void:
 			var cx := xr_origin.get_node("XRCamera3D") as XRCamera3D
 			tp = cx.global_transform.origin
 			yaw = cx.global_transform.basis.get_euler().y
-		peer.put_packet(("tf:%.2f:%.2f:%.2f:%.3f" % [tp.x, tp.y, tp.z, yaw]).to_utf8_buffer())
+		_put("tf:%.2f:%.2f:%.2f:%.3f" % [tp.x, tp.y, tp.z, yaw], false, CH_POSITION)
 	if Time.get_ticks_msec() - t0 > 120000 and bot and not spectate and not loop_done and OS.get_environment("BOT_NO_TIMEOUT") != "1":
 		printerr("BOT %s TIMEOUT phase=%s" % [bot_name, phase]); get_tree().quit(1)
 
 func _on_xr_button(button: String, right: bool) -> void:
 	if right and button == "trigger_click":
-		peer.put_packet("attack:x".to_utf8_buffer())
+		_put("attack:x")
 	elif right and button == "ax_button":
-		peer.put_packet("grab:x".to_utf8_buffer())
+		_put("grab:x")
 	elif not right and button == "by_button":
-		peer.put_packet("teleport:x".to_utf8_buffer())
+		_put("teleport:x")
 
 func _spectate_focus(delta: float) -> void:
 	# Tab cycles focus; number keys 1-9 jump; Esc returns to the wide overhead.
@@ -286,14 +408,14 @@ func _spectate_focus(delta: float) -> void:
 		hud.text = "SPECTATING — %s   [Tab/1-9 focus, Esc wide]" % who
 
 func _human_drive(delta: float) -> void:
-	if xr and left_hand:
+	if xr and left_hand and xr_origin.has_node("XRCamera3D"):
 		var stick: Vector2 = left_hand.get_vector2("primary")
-		var fwd: Vector3 = Vector3.FORWARD
-		if xr_origin.has_node("XRCamera3D"):
-			fwd = -(xr_origin.get_node("XRCamera3D") as XRCamera3D).global_transform.basis.z
-		fwd.y = 0.0; fwd = fwd.normalized()
-		var rightv: Vector3 = fwd.cross(Vector3.UP) * -1.0
-		avatar.position += (fwd * -stick.y + rightv * stick.x) * 3.0 * delta
+		var cam := xr_origin.get_node("XRCamera3D") as XRCamera3D
+		# camera-relative: stick up -> camera forward, stick right -> camera right
+		var move: Vector3 = cam.global_transform.basis * Vector3(stick.x, 0.0, -stick.y)
+		move.y = 0.0
+		if move.length() > 0.05:
+			avatar.position += move.normalized() * 3.0 * delta
 		return
 	var dir := Vector3.ZERO
 	if Input.is_key_pressed(KEY_W): dir.z -= 1
@@ -302,9 +424,9 @@ func _human_drive(delta: float) -> void:
 	if Input.is_key_pressed(KEY_D): dir.x += 1
 	avatar.velocity = dir.normalized() * 4.0
 	avatar.move_and_slide()
-	if Input.is_key_pressed(KEY_T): peer.put_packet("teleport:x".to_utf8_buffer())
-	if Input.is_action_just_pressed("ui_accept"): peer.put_packet("attack:x".to_utf8_buffer())
-	if Input.is_key_pressed(KEY_E): peer.put_packet("grab:x".to_utf8_buffer())
+	if Input.is_key_pressed(KEY_T): _put("teleport:x")
+	if Input.is_action_just_pressed("ui_accept"): _put("attack:x")
+	if Input.is_key_pressed(KEY_E): _put("grab:x")
 
 var bot_voted := false
 func _bot_drive(delta: float) -> void:
@@ -317,7 +439,7 @@ func _bot_drive(delta: float) -> void:
 				avatar.position = avatar.position.move_toward(target, 4.0 * delta)
 			elif not bot_voted:
 				bot_voted = true
-				peer.put_packet("teleport:x".to_utf8_buffer())
+				_put("teleport:x")
 		"field":
 			# close to melee range of the enemy at (0,-4), then attack on the beat
 			var target := Vector3(0.0, 0.0, -2.2)
@@ -328,5 +450,5 @@ func _bot_drive(delta: float) -> void:
 			# 0.3 s ~= 9 ticks at 30 Hz — inside the [6,18] combo window
 			if bot_attack_timer >= 0.3:
 				bot_attack_timer = 0.0
-				peer.put_packet("attack:x".to_utf8_buffer())
-				peer.put_packet("grab:x".to_utf8_buffer()) # grabs only land once loot spawns
+				_put("attack:x")
+				_put("grab:x") # grabs only land once loot spawns

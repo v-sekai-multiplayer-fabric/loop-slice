@@ -8,7 +8,7 @@ const MCPCommandsLib = preload("mcp_commands.gd")
 const MCPHttpServerLib = preload("mcp_http_server.gd")
 
 const HOST := "127.0.0.1"   # adb forward reaches the device loopback
-const HTTP_PORT := 8788
+var HTTP_PORT := int(OS.get_environment("MCP_PORT")) if OS.get_environment("MCP_PORT") != "" else 8788
 
 var _cmds = MCPCommandsLib.new()
 var _http = MCPHttpServerLib.new()
