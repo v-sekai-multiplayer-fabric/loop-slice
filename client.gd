@@ -345,9 +345,7 @@ func _physics_process(delta: float) -> void:
 	if my_id < 0:
 		if now - welcome_ms > 3000: my_id = 0   # no welcome — resend join
 		return
-	# (the "server went silent" rejoin path is removed: it false-triggered on
-	#  normal play and caused connect churn. A real drop shows as transport-down
-	#  above, which reconnects.)
+	# a real drop surfaces as transport-down above and reconnects there
 	# drain externally-queued packets through the working send path
 	if not mcp_queue.is_empty():
 		for s in mcp_queue: _put(String(s))
@@ -369,14 +367,6 @@ func _physics_process(delta: float) -> void:
 		_put("tf:%.2f:%.2f:%.2f:%.3f" % [tp.x, tp.y, tp.z, yaw], false, CH_POSITION)
 	if Time.get_ticks_msec() - t0 > 120000 and bot and not spectate and not loop_done and OS.get_environment("BOT_NO_TIMEOUT") != "1":
 		printerr("BOT %s TIMEOUT phase=%s" % [bot_name, phase]); get_tree().quit(1)
-
-func _on_xr_button(button: String, right: bool) -> void:
-	if right and button == "trigger_click":
-		_put("attack:x")
-	elif right and button == "ax_button":
-		_put("grab:x")
-	elif not right and button == "by_button":
-		_put("teleport:x")
 
 func _spectate_focus(delta: float) -> void:
 	# Tab cycles focus; number keys 1-9 jump; Esc returns to the wide overhead.

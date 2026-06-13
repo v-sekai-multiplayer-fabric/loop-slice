@@ -235,5 +235,5 @@ func step_tick() -> void:
 			broadcast("p:%d:%.2f:%.2f:%.2f:%.3f:%s:%d:%d" % [pid, pp.x, pp.y, pp.z, yw, kd, rt, age], false, CH_POSITION)
 	if tick % 15 == 0:
 		for pid in players: send_to(pid, "ping:%d" % Time.get_ticks_msec())
-	# (liveliness drop removed — it churned the loop; the FSM proof stands as the
-	#  spec, but the http3 multi-session implementation needs work first)
+	# no liveliness drop enforced here yet; the connection-FSM (liveliness window +
+	# 5s rejoin) is the proven spec to wire in so dead sessions leave the roster
